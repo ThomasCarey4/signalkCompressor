@@ -12,7 +12,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        craneLib = crane.lib.${system};
+        craneLib = crane.packages.${system}.crane;
       in
       {
         # Package for the Rust executable
