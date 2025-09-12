@@ -4,4 +4,5 @@ pkgs.rustPlatform.buildRustPackage rec {
   version = "0.1";
   cargoLock.lockFile = ./Cargo.lock;
   src = pkgs.lib.cleanSource ./.;
+  buildInputs = [ pkgs.pkg-config pkgs.openssl ];
 }
