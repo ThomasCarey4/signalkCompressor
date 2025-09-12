@@ -10,7 +10,7 @@
       pkgsFor = nixpkgs.legacyPackages;
     in {
       packages = forAllSystems (system: {
-        default = pkgsFor.${system}.callPackage ./. { };
+        default = pkgsFor.${system}.callPackage ./. { pkgs = pkgsFor.${system}; };
       });
     };
 }
