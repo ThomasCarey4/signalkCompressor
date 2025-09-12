@@ -91,7 +91,7 @@ impl Config {
             state_endpoint: env::var("STATE_ENDPOINT")
               .unwrap_or_else(|_| "https://actix.serengwen.thescareys.co.uk/state_data".to_string()),
             auth_token: env::var("AUTH_TOKEN")
-              .unwrap_or_else(|_| "***REMOVED_CREDENTIAL***".to_string()),
+              .unwrap_or_else(|_| "NO_TOKEN".to_string()),
 
             // Batching configuration
             max_batch_size_bytes: env::var("MAX_BATCH_SIZE_BYTES")
