@@ -212,11 +212,13 @@ impl CategoryPatterns {
                 Regex::new(r"^(.*)(ModeNumber)(.*)$").unwrap(),
                 Regex::new(r"^(.*)(consumedCharge)(.*)$").unwrap(),
                 Regex::new(r"^(electrical\.batteries.279)(.*)$").unwrap(),
+                Regex::new(r"^(propulsion\.)([^.]+)(\..*(diagnostic|status|raw|error|fault).*)$").unwrap()
             ],
             state: vec![
                 Regex::new(r"^(.*)((m|M)ode)$").unwrap(),
                 Regex::new(r"^(.*)\.(name)$").unwrap(),
                 Regex::new(r"^(.*)\.(state)$").unwrap(),
+                Regex::new(r"^(propulsion\.)([^.]+)(\.(gear|tiltTrim|runTime))$").unwrap()
                 Regex::new(r"^(electrical\.batteries\.)([0-9]+)(\.capacity\.dischargedEnergy)$").unwrap(),
                 Regex::new(r"^(electrical\.batteries\.)([0-9]+)(\.capacity\.stateOfCharge)$").unwrap(),
                 Regex::new(r"^(electrical\.batteries\.)([0-9]+)(\.lifetimeDischarge)$").unwrap(),
@@ -242,6 +244,7 @@ impl CategoryPatterns {
                 Regex::new(r"^(.*)([tT]emperature)$").unwrap(),
                 Regex::new(r"^(environment)(.*)$").unwrap(),
                 Regex::new(r"^(navigation)(.*)$").unwrap(),
+                Regex::new(r"^(propulsion)(.*)$").unwrap(),                
             ],
         }
     }
