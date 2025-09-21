@@ -212,13 +212,13 @@ impl CategoryPatterns {
                 Regex::new(r"^(.*)(ModeNumber)(.*)$").unwrap(),
                 Regex::new(r"^(.*)(consumedCharge)(.*)$").unwrap(),
                 Regex::new(r"^(electrical\.batteries.279)(.*)$").unwrap(),
-                Regex::new(r"^(propulsion\.)([^.]+)(\..*(diagnostic|status|raw|error|fault).*)$").unwrap()
+                Regex::new(r"^(propulsion\.)([^.]+)(\..*(diagnostic|status|raw|error|fault).*)$").unwrap(),
             ],
             state: vec![
-                Regex::new(r"^(.*)((m|M)ode)$").unwrap(),
+                Regex::new(r"^(.*)(([mM])ode)$").unwrap(),
                 Regex::new(r"^(.*)\.(name)$").unwrap(),
                 Regex::new(r"^(.*)\.(state)$").unwrap(),
-                Regex::new(r"^(propulsion\.)([^.]+)(\.(gear|tiltTrim|runTime))$").unwrap()
+                Regex::new(r"^(propulsion\.)([^.]+)(\.(gear|tiltTrim|runTime))$").unwrap(),
                 Regex::new(r"^(electrical\.batteries\.)([0-9]+)(\.capacity\.dischargedEnergy)$").unwrap(),
                 Regex::new(r"^(electrical\.batteries\.)([0-9]+)(\.capacity\.stateOfCharge)$").unwrap(),
                 Regex::new(r"^(electrical\.batteries\.)([0-9]+)(\.lifetimeDischarge)$").unwrap(),
@@ -354,6 +354,25 @@ impl DurableBuffer {
             disk_files,
             pending_acks: HashMap::new(),
         })
+    }
+
+    /// Remove all buffered state data (memory and disk)
+    fn clear_state_data(&mut self) -> io::Result<()> {
+        // Clear in-memory state buffer
+        self.memory_buffer.remove(&Category::State);
+
+        // Remove state disk file
+        let file_path = self.buffer_dir.join("State_buffer.bin");
+        if file_path.exists() {
+            std::fs::remove_file(&file_path)?;
+            // Recreate empty file for future use
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file_path)?;
+            self.disk_files.insert(Category::State, BufWriter::new(file));
+        }
+        Ok(())
     }
 
     /// Add data to the buffer, spilling to disk if memory limit exceeded
@@ -655,7 +674,8 @@ fn load_dictionary() -> Option<Vec<u8>> {
 
 /// Batch processor for collecting data before sending to buffer
 struct BatchProcessor {
-    state_batch: Vec<MeasurementData>,
+    state_latest: HashMap<String, MeasurementData>,
+    last_sent_state: HashMap<String, Value>,
     sensor_batch: Vec<MeasurementData>,
     position_batch: Vec<MeasurementData>,
     buffer: Arc<Mutex<DurableBuffer>>,
@@ -664,7 +684,8 @@ struct BatchProcessor {
 impl BatchProcessor {
     fn new(buffer: Arc<Mutex<DurableBuffer>>) -> Self {
         Self {
-            state_batch: Vec::new(),
+            state_latest: HashMap::new(),
+            last_sent_state: HashMap::new(),
             sensor_batch: Vec::new(),
             position_batch: Vec::new(),
             buffer,
@@ -674,10 +695,10 @@ impl BatchProcessor {
     fn add_data(&mut self, data: MeasurementData, category: Category, config: &Config) -> io::Result<()> {
         match category {
             Category::State => {
-                self.state_batch.push(data);
-                if self.state_batch.len() >= category.batch_size(config) {
-                    self.flush_batch(Category::State, config)?;
-                }
+                // Only keep the latest state per path
+                self.state_latest.insert(data.path.clone(), data);
+                // Optionally flush immediately or on interval
+                self.flush_batch(Category::State, config)?;
             }
             Category::Sensor => {
                 self.sensor_batch.push(data);
@@ -691,36 +712,48 @@ impl BatchProcessor {
                     self.flush_batch(Category::Position, config)?;
                 }
             }
-            Category::Dump => {} // Ignored
+            Category::Dump => {}
         }
         Ok(())
     }
 
     fn flush_batch(&mut self, category: Category, _config: &Config) -> io::Result<()> {
-        let batch = match category {
-            Category::State => std::mem::take(&mut self.state_batch),
-            Category::Sensor => std::mem::take(&mut self.sensor_batch),
-            Category::Position => std::mem::take(&mut self.position_batch),
-            Category::Dump => return Ok(()),
-        };
-
-        if batch.is_empty() {
-            return Ok(());
+        match category {
+            Category::State => {
+                let mut changed_states = Vec::new();
+                for (path, data) in &self.state_latest {
+                    let last = self.last_sent_state.get(path);
+                    if last != Some(&data.value) {
+                        changed_states.push(data.clone());
+                    }
+                }
+                if !changed_states.is_empty() {
+                    {
+                        let mut buffer = self.buffer.lock().unwrap();
+                        buffer.add_batch(Category::State, changed_states.clone())?;
+                    }
+                    for data in changed_states {
+                        self.last_sent_state.insert(data.path.clone(), data.value.clone());
+                    }
+                }
+                self.state_latest.clear();
+            }
+            Category::Sensor => {
+                let batch = std::mem::take(&mut self.sensor_batch);
+                if !batch.is_empty() {
+                    let mut buffer = self.buffer.lock().unwrap();
+                    buffer.add_batch(Category::Sensor, batch)?;
+                }
+            }
+            Category::Position => {
+                let batch = std::mem::take(&mut self.position_batch);
+                if !batch.is_empty() {
+                    let mut buffer = self.buffer.lock().unwrap();
+                    buffer.add_batch(Category::Position, batch)?;
+                }
+            }
+            Category::Dump => {}
         }
-
-        // Send to durable buffer
-        {
-            let mut buffer = self.buffer.lock().unwrap();
-            buffer.add_batch(category, batch.clone())?;
-        }
-
-        debug!("Flushed {} {} messages to buffer", batch.len(), match category {
-            Category::State => "state",
-            Category::Sensor => "sensor",
-            Category::Position => "position",
-            Category::Dump => "dump",
-        });
-
         Ok(())
     }
 
@@ -749,6 +782,8 @@ async fn async_main() -> anyhow::Result<()> {
     // Create durable buffer
     let buffer = Arc::new(Mutex::new(DurableBuffer::new(&config)?));
 
+    // Clear any existing state data
+    buffer.lock().unwrap().clear_state_data()?;
     // Create batch processor
     let mut batch_processor = BatchProcessor::new(buffer.clone());
 
