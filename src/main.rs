@@ -57,7 +57,7 @@ impl Config {
     fn from_env() -> Self {
         Self {
             state_batch_size: env::var("STATE_BATCH_SIZE")
-              .unwrap_or_else(|_| "100".to_string())
+              .unwrap_or_else(|_| "20".to_string())
               .parse()
               .unwrap_or(100),
             sensor_batch_size: env::var("SENSOR_BATCH_SIZE")
@@ -674,6 +674,7 @@ fn load_dictionary() -> Option<Vec<u8>> {
 
 /// Batch processor for collecting data before sending to buffer
 struct BatchProcessor {
+    state_batch: Vec<MeasurementData>,
     state_latest: HashMap<String, MeasurementData>,
     last_sent_state: HashMap<String, Value>,
     sensor_batch: Vec<MeasurementData>,
@@ -684,6 +685,7 @@ struct BatchProcessor {
 impl BatchProcessor {
     fn new(buffer: Arc<Mutex<DurableBuffer>>) -> Self {
         Self {
+            state_batch: Vec::new(),
             state_latest: HashMap::new(),
             last_sent_state: HashMap::new(),
             sensor_batch: Vec::new(),
@@ -695,15 +697,17 @@ impl BatchProcessor {
     fn add_data(&mut self, data: MeasurementData, category: Category, config: &Config) -> io::Result<()> {
         match category {
             Category::State => {
-                // Only keep the latest state per path
-                self.state_latest.insert(data.path.clone(), data);
-                // Optionally flush immediately or on interval
-                self.flush_batch(Category::State, config)?;
+                self.state_latest.insert(data.path.clone(), data.clone());
+                self.state_batch.push(data);
+                if self.state_batch.len() >= category.batch_size(config) {
+                    self.flush_batch(Category::State, config)?;
+                }
             }
             Category::Sensor => {
                 self.sensor_batch.push(data);
                 if self.sensor_batch.len() >= category.batch_size(config) {
                     self.flush_batch(Category::Sensor, config)?;
+                    self.flush_batch(Category::State, config)?;
                 }
             }
             Category::Position => {
