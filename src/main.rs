@@ -405,7 +405,7 @@ impl DurableBuffer {
         Ok(())
     }
 
-    /// Spill oldest items to disk to free memory
+    /// Spill the oldest items to disk to free memory
     fn spill_to_disk(&mut self, category: Category) -> io::Result<()> {
         if let Some(items) = self.memory_buffer.get_mut(&category) {
             if let Some(writer) = self.disk_files.get_mut(&category) {
@@ -429,7 +429,7 @@ impl DurableBuffer {
         Ok(())
     }
 
-    /// Get next batch to send, preferring memory over disk
+    /// Get next batch to send, preferring memory to disk
     fn get_batch(&mut self, category: Category, max_size_bytes: usize) -> io::Result<Option<BufferedItem>> {
         // First try memory buffer
         if let Some(items) = self.memory_buffer.get_mut(&category) {
