@@ -2,6 +2,10 @@
 name = "signalkCompressor"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Throttles, categorises and zstd-compresses a Signal K delta stream for upload over an intermittent marine link"
+repository = "https://github.com/ThomasCarey4/signalkCompressor"
+readme = "README.md"
 
 [dependencies]
 byteorder = "1.5.0"
