@@ -213,6 +213,13 @@ impl CategoryPatterns {
                 Regex::new(r"^(.*)(consumedCharge)(.*)$").unwrap(),
                 Regex::new(r"^(electrical\.batteries.279)(.*)$").unwrap(),
                 Regex::new(r"^(propulsion\.)([^.]+)(\..*(diagnostic|status|raw|error|fault).*)$").unwrap(),
+                // Per-satellite SNR/azimuth/elevation for the whole constellation: ~1.9 KB of
+                // JSON, 30x the average row, and receiver diagnostics nothing in SerenSite reads.
+                // It matches the `navigation.gns` State pattern below, but State's write-on-change
+                // dedupe never fires on it because the SNRs move every sample - so it shipped
+                // ~2560 rows/day. It is also what broke TimescaleDB compression for two months
+                // (jsonb too large for a btree minmax index); see ops/compression-fix.md.
+                Regex::new(r"^(navigation\.gnss\.satellitesInView)$").unwrap(),
             ],
             state: vec![
                 Regex::new(r"^(.*)(([mM])ode)$").unwrap(),
@@ -859,4 +866,45 @@ async fn async_main() -> anyhow::Result<()> {
     buffer.lock().unwrap().flush_all()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pattern in `CategoryPatterns` is a `Regex::new(..).unwrap()` built at runtime, so a
+    /// malformed one panics on startup rather than failing the build. Touching the lists forces
+    /// them all to compile.
+    #[test]
+    fn all_category_patterns_compile() {
+        let p = &*CATEGORY_PATTERNS;
+        assert!(!p.dump.is_empty() && !p.state.is_empty() && !p.sensor.is_empty());
+    }
+
+    #[test]
+    fn satellites_in_view_is_dumped() {
+        // Dumped despite matching the `navigation.gns` State pattern: dump is tested first.
+        assert_eq!(
+            categorize_data("navigation.gnss.satellitesInView"),
+            Category::Dump
+        );
+    }
+
+    #[test]
+    fn other_gnss_paths_are_still_state() {
+        for path in [
+            "navigation.gnss.satellites",
+            "navigation.gnss.type",
+            "navigation.gnss.methodQuality",
+            "navigation.gnss.horizontalDilution",
+            "navigation.gnss.geoidalSeparation",
+        ] {
+            assert_eq!(categorize_data(path), Category::State, "{path}");
+        }
+    }
+
+    #[test]
+    fn position_still_routes_to_position() {
+        assert_eq!(categorize_data("navigation.position"), Category::Position);
+    }
 }
