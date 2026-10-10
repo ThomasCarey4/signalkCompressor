@@ -25,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Configuration for the application
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Config {
     // Existing batch configuration
     state_batch_size: usize,
@@ -53,9 +53,49 @@ struct Config {
     max_concurrent_requests: usize,
 }
 
+/// Hand-written so that `auth_token` is never printed. The config is logged at startup, and a
+/// bearer token in the journal is a credential leak - the API that receives it had the same bug.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("websocket_url", &self.websocket_url)
+            .field("sensor_endpoint", &self.sensor_endpoint)
+            .field("position_endpoint", &self.position_endpoint)
+            .field("state_endpoint", &self.state_endpoint)
+            .field("auth_token", &format_args!("<redacted, {} bytes>", self.auth_token.len()))
+            .field("state_batch_size", &self.state_batch_size)
+            .field("sensor_batch_size", &self.sensor_batch_size)
+            .field("position_batch_size", &self.position_batch_size)
+            .field("state_sample_rate", &self.state_sample_rate)
+            .field("sensor_sample_rate", &self.sensor_sample_rate)
+            .field("position_sample_rate", &self.position_sample_rate)
+            .field("max_batch_size_bytes", &self.max_batch_size_bytes)
+            .field("batch_timeout_secs", &self.batch_timeout_secs)
+            .field("max_memory_buffer_bytes", &self.max_memory_buffer_bytes)
+            .field("buffer_directory", &self.buffer_directory)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .finish()
+    }
+}
+
 impl Config {
-    fn from_env() -> Self {
-        Self {
+    /// Reads configuration from the process environment.
+    ///
+    /// The three ingest endpoints are **required**: there is no sensible default for "where this
+    /// boat's data goes", and a placeholder would mean batches piling up in the buffer against a
+    /// host that will never answer. Everything else has a working default.
+    fn from_env() -> anyhow::Result<Self> {
+        fn require(name: &str) -> anyhow::Result<String> {
+            env::var(name).map_err(|_| {
+                anyhow::anyhow!(
+                    "{name} is not set - signalkCompressor needs SENSOR_ENDPOINT, \
+                     POSITION_ENDPOINT and STATE_ENDPOINT pointing at the ingest API"
+                )
+            })
+        }
+
+        Ok(Self {
             state_batch_size: env::var("STATE_BATCH_SIZE")
               .unwrap_or_else(|_| "20".to_string())
               .parse()
@@ -84,12 +124,9 @@ impl Config {
               .unwrap_or_else(|_| "ws://10.101.0.3:3000/signalk/v1/stream".to_string()),
 
             // HTTP endpoints
-            sensor_endpoint: env::var("SENSOR_ENDPOINT")
-              .unwrap_or_else(|_| "https://actix.serengwen.thescareys.co.uk/sensor_data".to_string()),
-            position_endpoint: env::var("POSITION_ENDPOINT")
-              .unwrap_or_else(|_| "https://actix.serengwen.thescareys.co.uk/position_data".to_string()),
-            state_endpoint: env::var("STATE_ENDPOINT")
-              .unwrap_or_else(|_| "https://actix.serengwen.thescareys.co.uk/state_data".to_string()),
+            sensor_endpoint: require("SENSOR_ENDPOINT")?,
+            position_endpoint: require("POSITION_ENDPOINT")?,
+            state_endpoint: require("STATE_ENDPOINT")?,
             auth_token: env::var("AUTH_TOKEN")
               .unwrap_or_else(|_| "NO_TOKEN".to_string()),
 
@@ -118,7 +155,7 @@ impl Config {
               .unwrap_or_else(|_| "15".to_string())
               .parse()
               .unwrap_or(15),
-        }
+        })
     }
 }
 
@@ -784,7 +821,7 @@ fn main() -> anyhow::Result<()> {
 async fn async_main() -> anyhow::Result<()> {
 
     // Load configuration
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     info!("Loaded config: {:?}", config);
 
     // Load zstd dictionary (optional, not used in current code)

@@ -64,13 +64,15 @@ spill threshold so the on-disk path is actually exercised.
 
 ## Configuration
 
-Everything is environment-driven, read once at startup. A `.env` in the working directory is loaded
-if present.
+Everything is environment-driven, read once at startup, straight from the process environment —
+there is no config file and no `.env` loading.
 
 | variable | default | notes |
 | --- | --- | --- |
+| `SENSOR_ENDPOINT` | **required** | startup fails if unset |
+| `POSITION_ENDPOINT` | **required** | startup fails if unset |
+| `STATE_ENDPOINT` | **required** | startup fails if unset |
 | `SIGNALK_WEBSOCKET_URL` | `ws://10.101.0.3:3000/signalk/v1/stream` | onboard Signal K server |
-| `SENSOR_ENDPOINT` / `POSITION_ENDPOINT` / `STATE_ENDPOINT` | the author's ingest host | **set these** |
 | `AUTH_TOKEN` | `NO_TOKEN` | HS256 JWT, sent as `Authorization: Bearer` |
 | `SENSOR_SAMPLE_RATE` / `POSITION_SAMPLE_RATE` / `STATE_SAMPLE_RATE` | 2000 / 1000 / 5000 ms | per-path throttle |
 | `SENSOR_BATCH_SIZE` / `POSITION_BATCH_SIZE` / `STATE_BATCH_SIZE` | 500 / 250 / 20 | measurements per POST |
@@ -80,8 +82,12 @@ if present.
 | `BUFFER_DIRECTORY` | `/var/lib/signalk_buffer` | spill location |
 | `REQUEST_TIMEOUT_SECS` | 30 | per POST |
 
-`AUTH_TOKEN` defaulting to `NO_TOKEN` means a missing token produces 401s rather than a startup
-error — check the logs, not the exit code.
+The three endpoints are required on purpose: there is no sensible default for "where this boat's
+data goes", and a placeholder host would mean batches silently accumulating in the buffer against
+something that will never answer. `AUTH_TOKEN`, by contrast, still defaults to `NO_TOKEN`, so a
+missing token produces 401s rather than a startup error — check the logs, not the exit code.
+
+The startup log prints the resolved config with `auth_token` redacted, so it is safe to paste.
 
 ## Building
 
@@ -112,6 +118,13 @@ POSITION_ENDPOINT=https://example.invalid/position_data \
 STATE_ENDPOINT=https://example.invalid/state_data \
 AUTH_TOKEN=<jwt> \
   ./target/release/signalkCompressor
+```
+
+Supply the token out of band rather than inline — a systemd `Environment=` value is readable via
+`systemctl show`, and on NixOS it also lands world-readable in the Nix store. Use an
+`EnvironmentFile` outside the store, or a secrets manager such as sops-nix or agenix.
+
+```bash
 ```
 
 Logging is `tracing`; set `RUST_LOG` to taste.
