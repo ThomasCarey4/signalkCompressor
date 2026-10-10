@@ -52,15 +52,26 @@ level 3 over a JSON array** with `Content-Type: application/zstd` and a bearer t
 `time` is epoch milliseconds. Compression typically pays for itself many times over on this data —
 the paths repeat on every sample, which is exactly what zstd's dictionary matching eats.
 
-**Buffers with ack/nack.** `DurableBuffer` holds pending batches in memory and returns a failed
-batch to the *front* of its queue, so an outage doesn't reorder or lose data. Past
-`MAX_MEMORY_BUFFER_BYTES` it spills to length-prefixed files under `BUFFER_DIRECTORY`.
+**Buffers with ack/nack.** `DurableBuffer` holds pending batches in memory; a batch whose POST
+failed is returned to the buffer rather than dropped, so a flaky link costs latency instead of
+data. Past `MAX_MEMORY_BUFFER_BYTES` it spills to length-prefixed files under `BUFFER_DIRECTORY`,
+and a damaged spill file is repaired on the next read: records that still frame correctly are kept,
+anything after the damage is discarded with a warning.
 
-A real limitation, stated plainly: **the buffer does not survive a restart.** Spill-to-disk only
-triggers past the memory ceiling (1 GB by default, and days of data is only megabytes), there is no
-signal handler, and startup clears the existing state buffer file. Restarting the process discards
-whatever it was holding. If you are operating this, drain it before restarting, or raise the
-spill threshold so the on-disk path is actually exercised.
+Two real limitations, stated plainly.
+
+**The buffer does not survive a restart.** Spill-to-disk only triggers past the memory ceiling
+(1 GB by default, and days of data is only megabytes), there is no signal handler, and startup
+clears the existing state buffer file. Restarting the process discards whatever it was holding. If
+you are operating this, drain it before restarting, or raise the spill threshold so the on-disk
+path is actually exercised.
+
+**Delivery is newest-first, and spilled data can starve.** The memory buffer is a `Vec` pushed at
+the back and popped from the back, so the most recent batch ships first. A nacked batch is
+reinserted at the *oldest* end, which is therefore retried last. Disk is only consulted once memory
+is empty, which under continuous traffic may never happen — so once data has spilled it can sit
+there indefinitely. Both behaviours are worth knowing before you rely on this for ordered or
+complete delivery; neither is hard to change, but changing them changes what ships first.
 
 ## Configuration
 

@@ -488,7 +488,54 @@ impl DurableBuffer {
         self.load_from_disk(category, max_size_bytes)
     }
 
-    /// Load items from disk buffer
+    /// Largest plausible spilled record. Without this bound a corrupt length
+    /// prefix drives a multi-gigabyte `vec![0u8; len]` allocation.
+    const MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
+
+    /// Read one length-prefixed record's raw bytes.
+    ///
+    /// `Ok(None)` is a clean end of file. `Err` means the framing is damaged -
+    /// a truncated record, or a length that cannot be real - and the caller
+    /// should treat everything from that point on as unrecoverable. This is
+    /// framing-level only: the payload is not parsed, so compacting a large
+    /// spill file does not deserialize it.
+    fn read_frame(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+        let len = match reader.read_u32::<BigEndian>() {
+            Ok(len) => len,
+            // Also covers a 1-3 byte trailing fragment, which byteorder reports
+            // as UnexpectedEof. Those bytes cannot be a record, so drop them.
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        if len == 0 || len > Self::MAX_RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("implausible spill record length {len}"),
+            ));
+        }
+
+        let mut buf = vec![0u8; len as usize];
+        match reader.read_exact(&mut buf) {
+            Ok(()) => Ok(Some(buf)),
+            // The bug this guards: read_exact answers "failed to fill whole
+            // buffer" on a half-written record, and the old code propagated it,
+            // returning before the compaction below could drop the bad tail. The
+            // file stayed damaged, so every poll hit it again - one truncated
+            // record wedged 484 MB of good data for ten months.
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("truncated spill record: wanted {len} bytes, file ended first"),
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Take the next item from the disk buffer, compacting the file as it goes.
+    ///
+    /// Damaged framing is survivable: the records before it are kept, the
+    /// remainder is discarded, and the file is rewritten so the fault clears
+    /// itself on the first read rather than recurring forever.
     fn load_from_disk(&mut self, category: Category, _max_size_bytes: usize) -> io::Result<Option<BufferedItem>> {
         let file_path = self.buffer_dir.join(format!("{:?}_buffer.bin", category));
 
@@ -497,44 +544,78 @@ impl DurableBuffer {
         }
 
         let mut reader = BufReader::new(File::open(&file_path)?);
-        let mut temp_items = Vec::new();
-        let mut found_item = None;
+        let mut corrupt: Option<String> = None;
 
-        // Read all items, taking the first one and keeping the rest
-        loop {
-            match reader.read_u32::<BigEndian>() {
-                Ok(len) => {
-                    let mut buffer = vec![0u8; len as usize];
-                    reader.read_exact(&mut buffer)?;
+        // The item being returned to the caller.
+        let found_item = match Self::read_frame(&mut reader) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<BufferedItem>(&bytes) {
+                Ok(item) => Some(item),
+                Err(e) => {
+                    // Framing is intact but this is not a BufferedItem - e.g. a
+                    // file written by an older build. Nothing after it can be
+                    // trusted either, so drop the lot instead of looping.
+                    corrupt = Some(format!("undecodable record: {e}"));
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(e) => {
+                corrupt = Some(e.to_string());
+                None
+            }
+        };
 
-                    let item: BufferedItem = serde_json::from_slice(&buffer)
-                      .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        // Copy whatever still frames correctly to a sibling file, then swap it
+        // in. Raw byte copy, one record at a time: constant memory regardless of
+        // how large the spill has grown.
+        let tmp_path = file_path.with_extension("bin.compacting");
+        let mut kept = 0usize;
+        let mut kept_bytes = 0u64;
 
-                    if found_item.is_none() {
-                        self.pending_acks.insert(item.id, item.clone());
-                        found_item = Some(item);
-                    } else {
-                        temp_items.push(item);
+        if corrupt.is_none() {
+            let mut writer = BufWriter::new(File::create(&tmp_path)?);
+            loop {
+                match Self::read_frame(&mut reader) {
+                    Ok(Some(bytes)) => {
+                        writer.write_u32::<BigEndian>(bytes.len() as u32)?;
+                        writer.write_all(&bytes)?;
+                        kept += 1;
+                        kept_bytes += 4 + bytes.len() as u64;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        corrupt = Some(e.to_string());
+                        break;
                     }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
             }
+            writer.flush()?;
+        } else {
+            File::create(&tmp_path)?;
         }
 
-        // Rewrite file with remaining items
-        let mut writer = BufWriter::new(OpenOptions::new()
-          .write(true)
-          .truncate(true)
-          .open(&file_path)?);
-
-        for item in temp_items {
-            let serialized = serde_json::to_vec(&item)
-              .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            writer.write_u32::<BigEndian>(serialized.len() as u32)?;
-            writer.write_all(&serialized)?;
+        if let Some(reason) = &corrupt {
+            warn!(
+                "Discarding damaged tail of {:?} spill file ({}); kept {} intact record(s)",
+                category, reason, kept
+            );
         }
-        writer.flush()?;
+
+        std::fs::rename(&tmp_path, &file_path)?;
+
+        // The retained append handle points at the inode that rename() just
+        // replaced, so further spills would vanish into an unlinked file.
+        let file = OpenOptions::new().create(true).append(true).open(&file_path)?;
+        self.disk_files.insert(category, BufWriter::new(file));
+
+        if let Some(item) = &found_item {
+            self.pending_acks.insert(item.id, item.clone());
+        }
+
+        debug!(
+            "Loaded batch from {:?} spill file; {} record(s) / {} bytes remain",
+            category, kept, kept_bytes
+        );
 
         Ok(found_item)
     }
@@ -944,4 +1025,196 @@ mod tests {
     fn position_still_routes_to_position() {
         assert_eq!(categorize_data("navigation.position"), Category::Position);
     }
+    // ---- DurableBuffer disk recovery ----
+    //
+    // A half-written record in a spill file used to make `load_from_disk`
+    // return `failed to fill whole buffer` before it could repair the file, so
+    // the same bad bytes were re-read forever. These cover the recovery.
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("slk-buf-test-{}-{}", tag, Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_buffer(dir: &PathBuf) -> DurableBuffer {
+        let mut disk_files = HashMap::new();
+        for category in [Category::State, Category::Sensor, Category::Position] {
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join(format!("{:?}_buffer.bin", category)))
+                .unwrap();
+            disk_files.insert(category, BufWriter::new(file));
+        }
+        DurableBuffer {
+            memory_buffer: HashMap::new(),
+            memory_usage: 0,
+            max_memory_bytes: 1 << 30,
+            buffer_dir: dir.clone(),
+            disk_files,
+            pending_acks: HashMap::new(),
+        }
+    }
+
+    fn item(timestamp: u64) -> BufferedItem {
+        BufferedItem {
+            id: Uuid::new_v4(),
+            category: "Sensor".to_string(),
+            data: Vec::new(),
+            timestamp,
+            size_bytes: 1,
+        }
+    }
+
+    /// Write raw length-prefixed frames, optionally cutting the last one short
+    /// the way a kill mid-write does.
+    fn write_spill(path: &PathBuf, items: &[BufferedItem], truncate_last_to: Option<usize>) {
+        let mut f = BufWriter::new(File::create(path).unwrap());
+        for (i, it) in items.iter().enumerate() {
+            let bytes = serde_json::to_vec(it).unwrap();
+            let last = i + 1 == items.len();
+            match truncate_last_to {
+                Some(n) if last => {
+                    // Full length prefix, short payload.
+                    f.write_u32::<BigEndian>(bytes.len() as u32).unwrap();
+                    f.write_all(&bytes[..n]).unwrap();
+                }
+                _ => {
+                    f.write_u32::<BigEndian>(bytes.len() as u32).unwrap();
+                    f.write_all(&bytes).unwrap();
+                }
+            }
+        }
+        f.flush().unwrap();
+    }
+
+    #[test]
+    fn truncated_tail_does_not_wedge_the_spill_file() {
+        let dir = scratch_dir("trunc");
+        let path = dir.join("Sensor_buffer.bin");
+        let items = vec![item(1), item(2), item(3), item(4)];
+        write_spill(&path, &items, Some(10));
+
+        let mut buf = test_buffer(&dir);
+
+        // The three intact records come back in order, no error at any point.
+        for expected in &items[..3] {
+            let got = buf
+                .load_from_disk(Category::Sensor, 1 << 20)
+                .expect("damaged tail must not surface as an error");
+            assert_eq!(got.expect("record should be present").timestamp, expected.timestamp);
+        }
+
+        // The truncated fourth is gone, and the file is empty rather than damaged.
+        assert!(buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncated_first_record_clears_the_file() {
+        let dir = scratch_dir("trunc-first");
+        let path = dir.join("Sensor_buffer.bin");
+        write_spill(&path, &[item(1)], Some(5));
+
+        let mut buf = test_buffer(&dir);
+        assert!(buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A length prefix that cannot be real must be rejected on sight - the old
+    /// code fed it straight to `vec![0u8; len]`.
+    #[test]
+    fn implausible_length_prefix_is_rejected_without_allocating() {
+        let dir = scratch_dir("huge-len");
+        let path = dir.join("Sensor_buffer.bin");
+        {
+            let mut f = BufWriter::new(File::create(&path).unwrap());
+            f.write_u32::<BigEndian>(u32::MAX).unwrap();
+            f.write_all(b"nowhere near that long").unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut buf = test_buffer(&dir);
+        assert!(buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Correct framing around something that is not a `BufferedItem` - e.g. a
+    /// file left by an older build.
+    #[test]
+    fn undecodable_record_discards_the_file() {
+        let dir = scratch_dir("undecodable");
+        let path = dir.join("Sensor_buffer.bin");
+        {
+            let mut f = BufWriter::new(File::create(&path).unwrap());
+            let junk = br#"{"not":"a buffered item"}"#;
+            f.write_u32::<BigEndian>(junk.len() as u32).unwrap();
+            f.write_all(junk).unwrap();
+            f.flush().unwrap();
+        }
+
+        let mut buf = test_buffer(&dir);
+        assert!(buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn intact_spill_file_round_trips_and_compacts() {
+        let dir = scratch_dir("clean");
+        let path = dir.join("Sensor_buffer.bin");
+        let items = vec![item(10), item(20)];
+        write_spill(&path, &items, None);
+        let original_len = std::fs::metadata(&path).unwrap().len();
+
+        let mut buf = test_buffer(&dir);
+
+        let first = buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().unwrap();
+        assert_eq!(first.timestamp, 10);
+        assert!(std::fs::metadata(&path).unwrap().len() < original_len);
+        assert!(buf.pending_acks.contains_key(&first.id));
+
+        let second = buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().unwrap();
+        assert_eq!(second.timestamp, 20);
+        assert!(buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// After compaction the retained append handle must point at the live file,
+    /// not the inode `rename` replaced, or later spills vanish silently.
+    #[test]
+    fn spilling_after_compaction_still_reaches_the_file() {
+        let dir = scratch_dir("rename");
+        let path = dir.join("Sensor_buffer.bin");
+        write_spill(&path, &[item(1), item(2)], None);
+
+        let mut buf = test_buffer(&dir);
+        buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().unwrap();
+
+        // Force a spill through the handle held in `disk_files`.
+        buf.memory_buffer
+            .entry(Category::Sensor)
+            .or_default()
+            .extend([item(30), item(31)]);
+        buf.spill_to_disk(Category::Sensor).unwrap();
+
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert!(on_disk > 0, "spill after compaction was written to an unlinked inode");
+
+        // And it is readable back.
+        let next = buf.load_from_disk(Category::Sensor, 1 << 20).unwrap().unwrap();
+        assert!([2u64, 30].contains(&next.timestamp));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
 }
