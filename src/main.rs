@@ -920,15 +920,62 @@ async fn async_main() -> anyhow::Result<()> {
     let http_sink = Arc::new(HttpSink::new(config.clone(), buffer.clone()));
     tokio::spawn(http_sink.clone().start());
 
-    // Connect to Signal K websocket
+    let mut rate_limiter = RateLimiter::new();
+    let mut backoff = RECONNECT_BACKOFF_MIN;
+
+    // Signal K going away (server restart, Pi network blip) must not end the process:
+    // the buffer is RAM-only, so exiting would throw away everything not yet shipped.
+    loop {
+        match run_session(&config, &mut batch_processor, &mut rate_limiter).await {
+            Ok(()) => backoff = RECONNECT_BACKOFF_MIN,
+            Err(e) => error!("Signal K session failed: {}", e),
+        }
+
+        // Hand any partial batches to the buffer so the sink ships them while we are offline.
+        if let Err(e) = batch_processor.flush_all(&config) {
+            error!("Failed to flush batches after disconnect: {}", e);
+        }
+        if let Err(e) = buffer.lock().unwrap().flush_all() {
+            error!("Failed to flush buffer after disconnect: {}", e);
+        }
+
+        warn!("Reconnecting to Signal K in {:?}", backoff);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
+    }
+}
+
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Signal K streams deltas continuously; this long without one means the socket is dead
+/// even if no close or error ever arrived (e.g. the peer vanished without a FIN).
+const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Connect to Signal K and process deltas until the connection ends.
+/// Returns `Ok` once a connection was established and then ended, so the caller can reset
+/// its backoff; a failed connect is an `Err`.
+async fn run_session(
+    config: &Config,
+    batch_processor: &mut BatchProcessor,
+    rate_limiter: &mut RateLimiter,
+) -> anyhow::Result<()> {
     let (ws_stream, _) = connect_async(&config.websocket_url).await?;
     info!("Connected to Signal K websocket at {}", config.websocket_url);
 
-    let mut rate_limiter = RateLimiter::new();
-    let (mut write, mut read) = ws_stream.split();
+    let (_write, mut read) = ws_stream.split();
 
-    // Process incoming websocket messages
-    while let Some(msg) = read.next().await {
+    loop {
+        let msg = match timeout(WEBSOCKET_IDLE_TIMEOUT, read.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => {
+                info!("Websocket stream ended");
+                break;
+            }
+            Err(_) => {
+                warn!("No Signal K data for {:?}, dropping connection", WEBSOCKET_IDLE_TIMEOUT);
+                break;
+            }
+        };
         match msg {
             Ok(Message::Text(text)) => {
                 match serde_json::from_str::<SignalKDelta>(&text) {
@@ -941,7 +988,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     if category == Category::Dump {
                                         continue;
                                     }
-                                    if !rate_limiter.should_transmit(&value.path, category, &config) {
+                                    if !rate_limiter.should_transmit(&value.path, category, config) {
                                         continue;
                                     }
                                     if category == Category::Position && is_zero_position(&value.value) {
@@ -954,7 +1001,7 @@ async fn async_main() -> anyhow::Result<()> {
                                         value: value.value.clone(),
                                         source: source.clone(),
                                     };
-                                    if let Err(e) = batch_processor.add_data(data, category, &config) {
+                                    if let Err(e) = batch_processor.add_data(data, category, config) {
                                         error!("Failed to add data to batch: {}", e);
                                     }
                                 }
@@ -978,10 +1025,6 @@ async fn async_main() -> anyhow::Result<()> {
             _ => {}
         }
     }
-
-    // Flush remaining batches and buffer
-    batch_processor.flush_all(&config)?;
-    buffer.lock().unwrap().flush_all()?;
 
     Ok(())
 }
